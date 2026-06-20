@@ -51,9 +51,10 @@ CLAUDE.private.md
 *.pem
 *.key
 
-# draw.io backup files
+# draw.io backup files and local style references
 .*.drawio.bkp
 *.drawio.bkp
+style-reference.drawio
 
 # Build artifacts
 dist/
