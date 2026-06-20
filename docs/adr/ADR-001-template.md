@@ -3,6 +3,12 @@
 ## Status
 Proposed | Accepted | Deprecated | Superseded
 
+## Date
+YYYY-MM-DD
+
+## Author
+Walid Moussa — [GitHub](https://github.com/walidmoussa) · [LinkedIn](https://www.linkedin.com/in/walid-moussa-8626268b/)
+
 ## Context
 [What is the situation that motivates this decision?]
 
