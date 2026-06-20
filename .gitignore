@@ -41,12 +41,19 @@ override.tf.json
 *_override.tf
 *_override.tf.json
 
+# Local Claude Code private instructions
+CLAUDE.private.md
+
 # Secrets / env
 .env
 .env.*
 !.env.example
 *.pem
 *.key
+
+# draw.io backup files
+.*.drawio.bkp
+*.drawio.bkp
 
 # Build artifacts
 dist/
