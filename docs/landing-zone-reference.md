@@ -246,7 +246,7 @@ changes which SCPs apply instantly.
 
 > Full OU hierarchy diagram: `docs/diagrams/ou-structure.png`
 
-![OU Structure](../diagrams/ou-structure.png)
+![OU Structure](./diagrams/ou-structure.png)
 
 ### Our Design Decision
 
@@ -832,14 +832,369 @@ _Coming in Phase 5. This chapter will cover:_
 
 ## Chapter 5 — Identity & Access
 
-_Coming in Phase 2. This chapter will cover:_
+### What It Is
 
-- _IAM Identity Center architecture and permission sets_
-- _ABAC vs RBAC comparison_
-- _Permission set matrix — who gets what in which accounts_
-- _ADFS federation for enterprise IdP integration_
-- _Terraform: `terraform/modules/identity/`_
-- _ADR-003 — SSO Provider Selection_
+IAM Identity Center is the AWS service that provides **single sign-on across all accounts** in an
+AWS Organization. It is the single entry point for every human accessing any AWS account — developers,
+security engineers, auditors, FinOps teams. Without it, each account manages its own IAM users, which
+becomes unmanageable at scale and impossible to secure consistently.
+
+IAM Identity Center operates in two modes:
+
+- **Native IdP**: manages users and groups internally — appropriate for AWS-only organizations
+- **External IdP relay**: delegates authentication to Okta, Azure AD/Entra ID, or ADFS via SAML 2.0
+  and syncs users/groups via SCIM — appropriate for enterprises with existing corporate directories
+
+This Landing Zone implements the native IdP for v1. External IdP federation is covered in the
+Zero-Trust Blueprint project (MAIA Portfolio — Project 06).
+
+### Why It Matters
+
+Without centralized identity:
+
+- A developer has 10 different IAM users with 10 different passwords across 10 accounts
+- Offboarding requires logging into each account separately and deleting each user
+- MFA enforcement is optional and inconsistent per account
+- CloudTrail shows `arn:aws:iam::123456789:user/john` — no way to know which John across 50 accounts
+
+With IAM Identity Center:
+
+- One login grants access to all assigned accounts with appropriate permissions
+- Offboarding is instant — disable the user once, lose access everywhere within minutes
+- MFA is enforced at the Identity Center level — applies universally
+- CloudTrail shows `arn:aws:sts::123456789:assumed-role/AWSReservedSSO_DeveloperAccess_xxx/john.doe@company.com`
+  — full identity context in every log event
+
+### When to Use It
+
+From day one. There is no valid architecture for a multi-account AWS environment that does not use
+centralized identity. Even a two-account setup benefits from Identity Center — the permission set
+structure you define now carries forward unchanged when you add 50 more accounts.
+
+### How It Works
+
+IAM Identity Center vends **temporary credentials** — not long-term access keys. The flow is:
+
+```mermaid
+sequenceDiagram
+    participant User as Developer
+    participant SSO as IAM Identity Center
+    participant STS as AWS STS
+    participant Acct as Target Account
+
+    User->>SSO: Authenticate (username + MFA)
+    SSO->>User: Show account + permission set list
+    User->>SSO: Select account + permission set
+    SSO->>STS: AssumeRoleWithSAML
+    STS->>User: Temporary credentials (1h default)
+    User->>Acct: API calls with temp credentials
+    Acct->>Acct: CloudTrail logs full identity context
+```
+
+Key components:
+
+**Permission Sets** define what a user can do in a target account. A permission set maps to an IAM role
+that IAM Identity Center creates automatically in each assigned account. The role name follows the
+pattern `AWSReservedSSO_<PermissionSetName>_<RandomSuffix>`.
+
+**Account Assignments** map a group (or user) + permission set to a specific account. The assignment
+is the access grant: "members of group `platform-team` get `AdministratorAccess` in the `Management`
+account."
+
+**Groups** are how access is managed at scale. Never assign permissions directly to users — always
+through groups. When a new developer joins, add them to the `developers` group; they inherit all
+account assignments automatically.
+
+> Full identity flow diagram: `docs/diagrams/identity-architecture.png`
+
+![Identity Architecture](./diagrams/identity-architecture.png)
+
+#### RBAC vs ABAC
+
+IAM Identity Center supports both access control models:
+
+| Model | How it works | Best for |
+|-------|-------------|---------|
+| **RBAC** (Role-Based) | Permission set assigned to a group → group assigned to an account | Most Landing Zone deployments — simple, auditable, predictable |
+| **ABAC** (Attribute-Based) | Tags on resources + tags on IAM principals control access dynamically | Large scale with many teams and projects — more complex to implement |
+
+**This Landing Zone uses RBAC.** Each permission set defines a fixed set of permissions. Groups map
+to roles. Accounts are assigned explicitly. This is the right starting point — ABAC can be layered on
+top within individual accounts as teams mature.
+
+#### Permission Set Matrix
+
+Six permission sets cover all access patterns in this Landing Zone:
+
+| Permission Set | Base Policy | Dev OU | Staging OU | Prod OU | Security OU | Infra OU | Management |
+|----------------|-------------|--------|------------|---------|-------------|----------|------------|
+| `AdministratorAccess` | AWS managed | ❌ | ❌ | ❌ | ✅ (Audit) | ✅ (Network) | ✅ |
+| `PowerUserAccess` | AWS managed | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `DeveloperAccess` | Custom | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| `ReadOnlyAccess` | AWS managed | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `SecurityAuditAccess` | SecurityAudit + ViewOnly | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `BillingAccess` | Billing | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
+
+**`AdministratorAccess`** — Full AWS access. Break-glass only. No one uses this for routine work.
+Assigned to the platform team leads group for emergency access. All usage triggers a CloudWatch alarm.
+
+**`PowerUserAccess`** — Full AWS access except IAM. Developers in Dev OU can deploy anything but
+cannot create IAM users, roles, or policies. Prevents privilege escalation in development accounts.
+
+**`DeveloperAccess`** — Custom policy scoped to developer-relevant services: EC2, ECS, Lambda, S3,
+RDS, CloudWatch, X-Ray, CodeBuild, ECR. Works in Dev and Staging. Never in Prod — production
+changes go through IaC pipelines, not human console access.
+
+**`ReadOnlyAccess`** — Default for new team members across all accounts. Lets people explore the
+environment without risk. Upgrade to a more permissive set after onboarding review.
+
+**`SecurityAuditAccess`** — Read all security services (GuardDuty, Security Hub, Config, CloudTrail,
+Macie, Inspector) across all accounts. The Security team uses this to investigate findings in the
+Audit Account and query logs cross-account via Security Lake. Cannot modify or delete anything.
+
+**`BillingAccess`** — Read and manage billing data. Restricted to the Management account. The FinOps
+team uses this to analyze costs in Cost Explorer and manage Budgets. Never applied to workload accounts.
+
+### Our Design Decision
+
+v1 uses IAM Identity Center as the native IdP — no external dependencies, simple to operate,
+upgradeable to enterprise IdP federation without rebuilding permission sets.
+
+→ Full rationale and alternatives in [ADR-003 — SSO Provider Selection](adr/ADR-003-sso-provider.md)
+
+### Terraform Implementation
+
+```hcl
+# ============================================================
+# REFERENCE IMPLEMENTATION — Sandbox only
+# In a real production deployment:
+# - IAM Identity Center is enabled at the organization level via the console
+#   before applying Terraform (cannot be enabled via Terraform directly)
+# - The identity store ID and instance ARN are discovered from the existing
+#   IAM Identity Center deployment, not created by Terraform
+# - Account assignments require all target accounts to exist first
+# - Permission set changes take effect immediately for active sessions —
+#   users may need to re-authenticate to see changes
+# See docs/landing-zone-reference.md — Chapter 5 for full context.
+# ============================================================
+
+data "aws_ssoadmin_instances" "main" {}
+
+locals {
+  sso_instance_arn  = tolist(data.aws_ssoadmin_instances.main.arns)[0]
+  identity_store_id = tolist(data.aws_ssoadmin_instances.main.identity_store_ids)[0]
+}
+
+# ── Permission Sets ───────────────────────────────────────────────────────────
+
+resource "aws_ssoadmin_permission_set" "administrator" {
+  name             = "AdministratorAccess"
+  description      = "Full AWS access — break-glass only, all usage triggers alert"
+  instance_arn     = local.sso_instance_arn
+  session_duration = "PT4H"
+
+  tags = var.tags
+}
+
+resource "aws_ssoadmin_managed_policy_attachment" "administrator" {
+  instance_arn       = local.sso_instance_arn
+  permission_set_arn = aws_ssoadmin_permission_set.administrator.arn
+  managed_policy_arn = "arn:aws:iam::aws:policy/AdministratorAccess"
+}
+
+resource "aws_ssoadmin_permission_set" "power_user" {
+  name             = "PowerUserAccess"
+  description      = "Full access except IAM — developers in Dev OU"
+  instance_arn     = local.sso_instance_arn
+  session_duration = "PT8H"
+
+  tags = var.tags
+}
+
+resource "aws_ssoadmin_managed_policy_attachment" "power_user" {
+  instance_arn       = local.sso_instance_arn
+  permission_set_arn = aws_ssoadmin_permission_set.power_user.arn
+  managed_policy_arn = "arn:aws:iam::aws:policy/PowerUserAccess"
+}
+
+resource "aws_ssoadmin_permission_set" "developer" {
+  name             = "DeveloperAccess"
+  description      = "Scoped developer permissions — Dev and Staging only"
+  instance_arn     = local.sso_instance_arn
+  session_duration = "PT8H"
+
+  tags = var.tags
+}
+
+resource "aws_ssoadmin_permission_set_inline_policy" "developer" {
+  instance_arn       = local.sso_instance_arn
+  permission_set_arn = aws_ssoadmin_permission_set.developer.arn
+  inline_policy      = data.aws_iam_policy_document.developer.json
+}
+
+data "aws_iam_policy_document" "developer" {
+  statement {
+    sid    = "DeveloperServices"
+    effect = "Allow"
+    actions = [
+      "ec2:*", "ecs:*", "ecr:*", "lambda:*",
+      "s3:*", "rds:Describe*", "rds:List*",
+      "cloudwatch:*", "logs:*", "xray:*",
+      "codebuild:*", "codecommit:*",
+      "ssm:GetParameter*", "ssm:DescribeParameters",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "DenyIAMWrite"
+    effect = "Deny"
+    actions = [
+      "iam:CreateUser", "iam:DeleteUser",
+      "iam:CreateRole", "iam:DeleteRole",
+      "iam:AttachRolePolicy", "iam:DetachRolePolicy",
+      "iam:PutRolePolicy", "iam:DeleteRolePolicy",
+    ]
+    resources = ["*"]
+  }
+}
+
+resource "aws_ssoadmin_permission_set" "read_only" {
+  name             = "ReadOnlyAccess"
+  description      = "Read-only access — default for new team members"
+  instance_arn     = local.sso_instance_arn
+  session_duration = "PT8H"
+
+  tags = var.tags
+}
+
+resource "aws_ssoadmin_managed_policy_attachment" "read_only" {
+  instance_arn       = local.sso_instance_arn
+  permission_set_arn = aws_ssoadmin_permission_set.read_only.arn
+  managed_policy_arn = "arn:aws:iam::aws:policy/ReadOnlyAccess"
+}
+
+resource "aws_ssoadmin_permission_set" "security_audit" {
+  name             = "SecurityAuditAccess"
+  description      = "Read all security services across all accounts"
+  instance_arn     = local.sso_instance_arn
+  session_duration = "PT8H"
+
+  tags = var.tags
+}
+
+resource "aws_ssoadmin_managed_policy_attachment" "security_audit_1" {
+  instance_arn       = local.sso_instance_arn
+  permission_set_arn = aws_ssoadmin_permission_set.security_audit.arn
+  managed_policy_arn = "arn:aws:iam::aws:policy/SecurityAudit"
+}
+
+resource "aws_ssoadmin_managed_policy_attachment" "security_audit_2" {
+  instance_arn       = local.sso_instance_arn
+  permission_set_arn = aws_ssoadmin_permission_set.security_audit.arn
+  managed_policy_arn = "arn:aws:iam::aws:policy/job-function/ViewOnlyAccess"
+}
+
+resource "aws_ssoadmin_permission_set" "billing" {
+  name             = "BillingAccess"
+  description      = "Billing and cost management — Management account only"
+  instance_arn     = local.sso_instance_arn
+  session_duration = "PT8H"
+
+  tags = var.tags
+}
+
+resource "aws_ssoadmin_managed_policy_attachment" "billing" {
+  instance_arn       = local.sso_instance_arn
+  permission_set_arn = aws_ssoadmin_permission_set.billing.arn
+  managed_policy_arn = "arn:aws:iam::aws:policy/job-function/Billing"
+}
+
+# ── Account Assignments (illustrative — replace IDs with real values) ────────
+# REFERENCE ONLY — replace account IDs and group IDs with real values
+
+# Example: platform team gets AdministratorAccess in Management account
+resource "aws_ssoadmin_account_assignment" "platform_admin_mgmt" {
+  instance_arn       = local.sso_instance_arn
+  permission_set_arn = aws_ssoadmin_permission_set.administrator.arn
+
+  principal_id   = var.platform_team_group_id
+  principal_type = "GROUP"
+
+  target_id   = var.management_account_id
+  target_type = "AWS_ACCOUNT"
+}
+
+# Example: developers get PowerUserAccess in Dev accounts
+resource "aws_ssoadmin_account_assignment" "developers_dev" {
+  for_each = toset(var.dev_account_ids)
+
+  instance_arn       = local.sso_instance_arn
+  permission_set_arn = aws_ssoadmin_permission_set.power_user.arn
+
+  principal_id   = var.developers_group_id
+  principal_type = "GROUP"
+
+  target_id   = each.value
+  target_type = "AWS_ACCOUNT"
+}
+
+# Example: security team gets SecurityAuditAccess in all accounts
+resource "aws_ssoadmin_account_assignment" "security_all" {
+  for_each = toset(concat(
+    var.dev_account_ids,
+    var.staging_account_ids,
+    var.prod_account_ids,
+    [var.management_account_id, var.audit_account_id, var.log_archive_account_id]
+  ))
+
+  instance_arn       = local.sso_instance_arn
+  permission_set_arn = aws_ssoadmin_permission_set.security_audit.arn
+
+  principal_id   = var.security_team_group_id
+  principal_type = "GROUP"
+
+  target_id   = each.value
+  target_type = "AWS_ACCOUNT"
+}
+```
+
+### Pitfalls & Best Practices
+
+**Pitfall: Assigning permissions directly to users instead of groups**
+When a user leaves, you must find and remove every individual assignment. With groups, removing the
+user from the group revokes all access instantly. Always manage access through groups — never assign
+permission sets directly to users except for break-glass emergency accounts.
+
+**Pitfall: Not setting a session duration**
+The default session duration is 1 hour. For developers working all day this means constant re-authentication.
+Set `DeveloperAccess` and `PowerUserAccess` to 8 hours. Keep `AdministratorAccess` at 4 hours — short
+sessions for high-privilege access reduce the blast radius of a compromised session.
+
+**Pitfall: Using IAM Identity Center in the wrong region**
+IAM Identity Center has a home region. Once set, it cannot be changed without recreating the instance
+and losing all users, groups, and assignments. Choose your primary AWS region deliberately — use the
+same region as your management account's primary operations region.
+
+**Pitfall: Granting AdministratorAccess in workload accounts**
+Production accounts should have zero humans with AdministratorAccess. All production changes go through
+IaC pipelines (Terraform, CDK) that run with service roles — not human console access. If you need to
+investigate a production issue, `ReadOnlyAccess` or `SecurityAuditAccess` is sufficient.
+
+**Best practice: CloudWatch alarm on AdministratorAccess usage**
+Create a CloudWatch metric filter on CloudTrail for events where the assumed role matches
+`AWSReservedSSO_AdministratorAccess_*`. Alert immediately — any use of AdministratorAccess should be
+a conscious break-glass event, not routine work.
+
+**Best practice: Use SCPs as a second layer**
+IAM Identity Center controls who can access what. SCPs control what anyone can do once they're in.
+They are independent layers. A misconfigured permission set that grants too much access is still
+bounded by the SCPs on the OU. Defense in depth.
+
+**Best practice: Document the migration path to external IdP**
+Even if you start with native IdP, document the migration plan to your future external IdP (Okta,
+Entra ID). The permission set structure does not change — only the user source changes. Having this
+documented avoids a full redesign when the migration becomes urgent.
 
 ---
 
@@ -1065,7 +1420,7 @@ _Coming in Phase 6._
 | -------------------------------------- | -------------------------------- | -------- | --------- |
 | [ADR-001](adr/ADR-001-ou-structure.md) | OU Structure                     | Accepted | Chapter 1 |
 | [ADR-002](adr/ADR-002-scp-strategy.md) | SCP Strategy                     | Accepted | Chapter 2 |
-| ADR-003                                | SSO Provider Selection           | Pending  | Chapter 5 |
+| [ADR-003](adr/ADR-003-sso-provider.md) | SSO Provider Selection           | Accepted | Chapter 5 |
 | ADR-004                                | Networking Pattern               | Pending  | Chapter 6 |
 | ADR-005                                | Account Factory                  | Pending  | Chapter 4 |
 | ADR-006                                | Log Centralization Strategy      | Pending  | Chapter 8 |
